@@ -15,8 +15,37 @@ const __dirname = path.dirname(__filename);
 
 dotenv.config();
 
+// Configuration constants
+const CONFIG = {
+  server: {
+    name: process.env.MCP_SERVER_NAME || "memory",
+    version: process.env.MCP_SERVER_VERSION || "1.0.0",
+    displayName: process.env.MCP_SERVER_DISPLAY_NAME || "Memory Server",
+    description: process.env.MCP_SERVER_DESCRIPTION || "A server for storing and retrieving memories with semantic search capabilities",
+    publisher: process.env.MCP_SERVER_PUBLISHER || "MCP",
+    protocolVersion: process.env.MCP_PROTOCOL_VERSION || "2024-11-05"
+  },
+  logging: {
+    levels: ["error", "warn", "info", "debug"],
+    debugFile: process.env.MCP_DEBUG_LOG_PATH || path.join(__dirname, '../memory-debug.log')
+  },
+  db: {
+    connectionString: process.env.DATABASE_URL,
+    maxPoolSize: parseInt(process.env.DB_MAX_POOL_SIZE || "20"),
+    idleTimeout: parseInt(process.env.DB_IDLE_TIMEOUT || "30000")
+  },
+  embeddings: {
+    model: process.env.EMBEDDINGS_MODEL || "Xenova/all-MiniLM-L6-v2",
+    pooling: process.env.EMBEDDINGS_POOLING || "mean",
+    normalize: process.env.EMBEDDINGS_NORMALIZE !== "false"
+  },
+  search: {
+    defaultLimit: parseInt(process.env.SEARCH_DEFAULT_LIMIT || "10")
+  }
+};
+
 // Debug log file path
-const DEBUG_LOG_PATH = path.join(__dirname, '../memory-debug.log');
+const DEBUG_LOG_PATH = CONFIG.logging.debugFile;
 
 // Function to write debug logs to file
 function debugLog(message, data = {}) {
@@ -41,7 +70,9 @@ try {
 let pool;
 try {
   pool = new Pool({
-    connectionString: process.env.DATABASE_URL
+    connectionString: CONFIG.db.connectionString,
+    max: CONFIG.db.maxPoolSize,
+    idleTimeoutMillis: CONFIG.db.idleTimeout
   });
   console.error("PostgreSQL connection pool initialized");
 } catch (error) {
@@ -88,8 +119,8 @@ async function getEmbedder() {
   if (!embedderInitializing) {
     embedderInitializing = true;
     try {
-      sendLogMessage('info', 'Initializing embedder...');
-      embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+      sendLogMessage('info', 'Initializing embedder...', { model: CONFIG.embeddings.model });
+      embedder = await pipeline('feature-extraction', CONFIG.embeddings.model);
       sendLogMessage('info', 'Embedder initialized successfully');
     } catch (error) {
       sendLogMessage('error', `Error initializing embedder: ${error.message}`, { stack: error.stack });
@@ -357,11 +388,11 @@ rl.on('line', async (line) => {
 
       // Server info and capabilities
       const serverInfo = {
-        name: "memory",
-        version: "1.0.0", 
-        displayName: "Memory Server",
-        description: "A server for storing and retrieving memories with semantic search capabilities",
-        publisher: "MCP"
+        name: CONFIG.server.name,
+        version: CONFIG.server.version,
+        displayName: CONFIG.server.displayName,
+        description: CONFIG.server.description,
+        publisher: CONFIG.server.publisher
       };
       
       // Log server info for debugging
@@ -385,10 +416,10 @@ rl.on('line', async (line) => {
               listChanged: false
             },
             logging: {
-              levels: ["error", "warn", "info", "debug"]
+              levels: CONFIG.logging.levels
             }
           },
-          protocolVersion: "2024-11-05"
+          protocolVersion: CONFIG.server.protocolVersion
         }
       };
 
@@ -553,7 +584,7 @@ rl.on('line', async (line) => {
                 await initializeDatabase();
               }
               
-              const { query, type, tags, limit = 10 } = toolArgs;
+              const { query, type, tags, limit = CONFIG.search.defaultLimit } = toolArgs;
               sendLogMessage('info', 'Searching memories', { query, type, tags, limit });
               
               const embedding = await generateEmbedding(query);
