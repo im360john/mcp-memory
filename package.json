@@ -1,0 +1,22 @@
+{
+  "name": "mcp-memory",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MCP server with mem0 integration for long-term memory using PostgreSQL and pgvector",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "@xenova/transformers": "^2.15.1",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
