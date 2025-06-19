@@ -492,11 +492,12 @@ app.get('/mcp/v1/sse', async (req, res) => {
   }
 });
 
-// SSE endpoint for real-time communication (GET only)
+// SSE endpoint using Streamable HTTP transport (handles both GET and POST)
 app.get('/mcp/v1/sse', async (req, res) => {
-  infoLog('SSE connection attempt', {
+  infoLog('SSE connection attempt via Streamable HTTP', {
     ip: req.ip,
-    userAgent: req.get('User-Agent')
+    userAgent: req.get('User-Agent'),
+    headers: req.headers
   });
   
   try {
@@ -505,61 +506,108 @@ app.get('/mcp/v1/sse', async (req, res) => {
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Cache-Control, mcp-session-id',
+      'Access-Control-Allow-Headers': 'Cache-Control, mcp-session-id, Content-Type',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
     });
 
     sseClients.add(res);
-    infoLog('SSE client added', { totalClients: sseClients.size });
+    infoLog('SSE client added via Streamable HTTP', { totalClients: sseClients.size });
 
-    // Send initial connection event exactly like Snowflake server
-    const openEvent = {
-      protocol: "mcp",
-      version: "1.0.0",
-      capabilities: {
-        tools: true
+    // Send initialization response immediately like working servers
+    const initResponse = {
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        protocolVersion: "2024-11-05", 
+        capabilities: {
+          tools: {
+            listChanged: false
+          }
+        },
+        serverInfo: {
+          name: "memory",
+          version: "1.0.0"
+        }
       }
     };
     
-    res.write(`event: open\n`);
-    res.write(`data: ${JSON.stringify(openEvent)}\n\n`);
-    debugLog('Sent open event to SSE client', openEvent);
+    res.write(`data: ${JSON.stringify(initResponse)}\n\n`);
+    debugLog('Sent init response via SSE', initResponse);
 
-    // Send tools immediately to mimic working servers
-    if (isGlobalSessionReady && globalMCPSession?.tools?.length > 0) {
-      const toolsEvent = {
-        tools: globalMCPSession.tools
-      };
-      
-      res.write(`event: tools\n`);
-      res.write(`data: ${JSON.stringify(toolsEvent)}\n\n`);
-      debugLog('Sent tools event to SSE client', { toolCount: globalMCPSession.tools.length });
-      
-      // Also send capabilities
-      const capabilitiesEvent = {
-        tools: {
-          listChanged: false
-        }
-      };
-      
-      res.write(`event: capabilities\n`);
-      res.write(`data: ${JSON.stringify(capabilitiesEvent)}\n\n`);
-      debugLog('Sent capabilities event to SSE client', capabilitiesEvent);
-    } else {
-      debugLog('Session not ready or no tools, skipping tools event');
-    }
+    // Send tools list immediately
+    const toolsResponse = {
+      jsonrpc: "2.0", 
+      id: 2,
+      result: {
+        tools: globalMCPSession?.tools || [
+          {
+            name: "memory.create",
+            description: "Create a new memory entry",
+            inputSchema: {
+              type: "object",
+              required: ["type", "content", "source", "confidence"],
+              properties: {
+                type: { type: "string", description: "Type of memory" },
+                content: { type: "object", description: "Content to store" },
+                source: { type: "string", description: "Source of the memory" },
+                tags: { type: "array", items: { type: "string" }, description: "Optional tags" },
+                confidence: { type: "number", description: "Confidence score between 0 and 1" }
+              }
+            }
+          },
+          {
+            name: "memory.search", 
+            description: "Search for memories using semantic similarity",
+            inputSchema: {
+              type: "object",
+              required: ["query"],
+              properties: {
+                query: { type: "string", description: "Search query" },
+                type: { type: "string", description: "Optional type filter" },
+                tags: { type: "array", items: { type: "string" }, description: "Optional tags filter" },
+                limit: { type: "number", description: "Maximum number of results to return" }
+              }
+            }
+          },
+          {
+            name: "memory.list",
+            description: "List all memories", 
+            inputSchema: {
+              type: "object",
+              properties: {
+                type: { type: "string", description: "Optional type filter" },
+                tags: { type: "array", items: { type: "string" }, description: "Optional tags filter" }
+              }
+            }
+          }
+        ]
+      }
+    };
+    
+    res.write(`data: ${JSON.stringify(toolsResponse)}\n\n`);
+    debugLog('Sent tools response via SSE', { toolCount: toolsResponse.result.tools.length });
+
+    // Send ping responses immediately
+    const pingResponse = {
+      jsonrpc: "2.0",
+      id: 3
+    };
+    
+    res.write(`data: ${JSON.stringify(pingResponse)}\n\n`);
+    debugLog('Sent ping response via SSE');
 
     const heartbeat = setInterval(() => {
       if (sseClients.has(res)) {
         try {
+          // Send periodic ping responses
           const pingEvent = {
-            type: "ping",
-            timestamp: new Date().toISOString()
+            jsonrpc: "2.0",
+            id: Date.now(),
+            result: {}
           };
           
-          res.write(`event: ping\n`);
           res.write(`data: ${JSON.stringify(pingEvent)}\n\n`);
-          debugLog('Sent heartbeat ping to SSE client');
+          debugLog('Sent heartbeat ping via SSE');
         } catch (error) {
           errorLog('Failed to send heartbeat', error);
           clearInterval(heartbeat);
@@ -568,23 +616,195 @@ app.get('/mcp/v1/sse', async (req, res) => {
       } else {
         clearInterval(heartbeat);
       }
-    }, 30000);
+    }, 10000); // Send every 10 seconds to keep connection alive
 
     req.on('close', () => {
       clearInterval(heartbeat);
       sseClients.delete(res);
-      infoLog('SSE client disconnected', { remainingClients: sseClients.size });
+      infoLog('SSE client disconnected via Streamable HTTP', { remainingClients: sseClients.size });
     });
 
     req.on('error', (error) => {
       clearInterval(heartbeat);
       sseClients.delete(res);
-      errorLog('SSE connection error', error);
+      errorLog('SSE connection error via Streamable HTTP', error);
     });
 
   } catch (error) {
-    errorLog('SSE endpoint error', error);
+    errorLog('SSE endpoint error via Streamable HTTP', error);
     res.status(500).send('Internal Server Error');
+  }
+});
+
+// POST to same endpoint for Streamable HTTP JSON-RPC
+app.post('/mcp/v1/sse', async (req, res) => {
+  const startTime = Date.now();
+  
+  infoLog('JSON-RPC via Streamable HTTP POST', {
+    method: req.body?.method,
+    id: req.body?.id,
+    hasParams: !!req.body?.params,
+    contentType: req.headers['content-type']
+  });
+  
+  try {
+    debugLog('Full Streamable HTTP request body', req.body);
+    
+    const { jsonrpc, id, method, params } = req.body;
+    
+    if (jsonrpc !== "2.0") {
+      const errorResponse = {
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32600,
+          message: "Invalid Request: jsonrpc version must be 2.0"
+        }
+      };
+      
+      errorLog('Invalid JSON-RPC version via Streamable HTTP', { received: jsonrpc, expected: "2.0" });
+      return res.json(errorResponse);
+    }
+
+    let result;
+
+    switch (method) {
+      case 'initialize':
+        debugLog('Handling initialize via Streamable HTTP', params);
+        result = {
+          protocolVersion: "2024-11-05",
+          capabilities: {
+            tools: {
+              listChanged: false
+            }
+          },
+          serverInfo: {
+            name: "memory",
+            version: "1.0.0"
+          }
+        };
+        infoLog(`Initialize handled via Streamable HTTP in ${Date.now() - startTime}ms`);
+        break;
+
+      case 'ping':
+        debugLog('Handling ping via Streamable HTTP');
+        infoLog(`Ping handled via Streamable HTTP in ${Date.now() - startTime}ms`);
+        return res.json({
+          jsonrpc: "2.0",
+          id
+        });
+      
+      case 'tools/list':
+        debugLog('Handling tools/list via Streamable HTTP', {
+          sessionReady: isGlobalSessionReady,
+          toolsAvailable: globalMCPSession?.tools?.length || 0
+        });
+        
+        result = {
+          tools: globalMCPSession?.tools || [
+            {
+              name: "memory.create",
+              description: "Create a new memory entry",
+              inputSchema: {
+                type: "object",
+                required: ["type", "content", "source", "confidence"],
+                properties: {
+                  type: { type: "string", description: "Type of memory" },
+                  content: { type: "object", description: "Content to store" },
+                  source: { type: "string", description: "Source of the memory" },
+                  tags: { type: "array", items: { type: "string" }, description: "Optional tags" },
+                  confidence: { type: "number", description: "Confidence score between 0 and 1" }
+                }
+              }
+            },
+            {
+              name: "memory.search",
+              description: "Search for memories using semantic similarity",
+              inputSchema: {
+                type: "object",
+                required: ["query"],
+                properties: {
+                  query: { type: "string", description: "Search query" },
+                  type: { type: "string", description: "Optional type filter" },
+                  tags: { type: "array", items: { type: "string" }, description: "Optional tags filter" },
+                  limit: { type: "number", description: "Maximum number of results to return" }
+                }
+              }
+            },
+            {
+              name: "memory.list",
+              description: "List all memories",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  type: { type: "string", description: "Optional type filter" },
+                  tags: { type: "array", items: { type: "string" }, description: "Optional tags filter" }
+                }
+              }
+            }
+          ]
+        };
+        infoLog(`Tools list handled via Streamable HTTP in ${Date.now() - startTime}ms`, {
+          toolCount: result.tools.length
+        });
+        break;
+        
+      case 'tools/call':
+        debugLog('Handling tools/call via Streamable HTTP', {
+          toolName: params?.name,
+          sessionReady: isGlobalSessionReady,
+          hasArguments: !!params?.arguments
+        });
+        
+        if (!isGlobalSessionReady) {
+          throw new Error('MCP session not ready');
+        }
+        
+        const toolResult = await globalMCPSession.callTool(params.name, params.arguments || params.input || {});
+        
+        result = {
+          content: [
+            {
+              type: "text", 
+              text: JSON.stringify(toolResult)
+            }
+          ]
+        };
+        infoLog(`Tool call ${params.name} handled via Streamable HTTP in ${Date.now() - startTime}ms`);
+        break;
+
+      case 'notifications/initialized':
+        debugLog('Handling notifications/initialized via Streamable HTTP');
+        infoLog('Received initialized notification via Streamable HTTP');
+        return res.status(204).send();
+        
+      default:
+        errorLog('Unsupported method via Streamable HTTP', { method });
+        throw new Error(`Unsupported method: ${method}`);
+    }
+
+    const response = {
+      jsonrpc: "2.0",
+      id,
+      result
+    };
+    
+    debugLog('Sending JSON-RPC response via Streamable HTTP', response);
+    res.json(response);
+
+  } catch (error) {
+    errorLog(`Error handling MCP method via Streamable HTTP ${req.body?.method}`, error);
+    
+    const errorResponse = {
+      jsonrpc: "2.0",
+      id: req.body?.id || null,
+      error: {
+        code: -32000,
+        message: error.message
+      }
+    };
+    
+    res.json(errorResponse);
   }
 });
 
