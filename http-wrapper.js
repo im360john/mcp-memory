@@ -13,8 +13,21 @@ const app = express();
 const PORT = process.env.PORT || 3333;
 
 // Enable CORS and JSON parsing
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'mcp-session-id', 'Authorization'],
+  credentials: false
+}));
 app.use(express.json());
+
+// Handle OPTIONS requests for CORS preflight
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, mcp-session-id, Authorization');
+  res.sendStatus(200);
+});
 
 // Store active MCP sessions
 const sessions = new Map();
@@ -169,8 +182,33 @@ class MCPSession {
       initialized: this.initialized
     })}\n\n`);
 
+    // Send heartbeat every 30 seconds to keep connection alive
+    const heartbeat = setInterval(() => {
+      if (this.sseClients.has(res)) {
+        try {
+          res.write(`data: ${JSON.stringify({
+            type: 'heartbeat',
+            timestamp: new Date().toISOString()
+          })}\n\n`);
+        } catch (error) {
+          clearInterval(heartbeat);
+          this.sseClients.delete(res);
+        }
+      } else {
+        clearInterval(heartbeat);
+      }
+    }, 30000);
+
     res.on('close', () => {
+      clearInterval(heartbeat);
       this.sseClients.delete(res);
+      console.log(`SSE client disconnected from session ${this.sessionId}`);
+    });
+
+    res.on('error', (error) => {
+      clearInterval(heartbeat);
+      this.sseClients.delete(res);
+      console.error(`SSE client error in session ${this.sessionId}:`, error.message);
     });
   }
 
@@ -228,6 +266,49 @@ class MCPSession {
     });
   }
 
+  async ping() {
+    // For ping, we can respond immediately without going to the MCP server
+    // since the HTTP wrapper itself is the connection indicator
+    return { pong: true };
+  }
+
+  async sendMCPMessage(method, params = {}) {
+    if (!this.initialized && method !== 'ping') {
+      throw new Error('MCP session not initialized');
+    }
+
+    // Handle ping locally
+    if (method === 'ping') {
+      return { pong: true };
+    }
+
+    const messageId = this.getNextMessageId();
+    const message = {
+      jsonrpc: "2.0",
+      id: messageId,
+      method: method,
+      params: params
+    };
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.requestCallbacks.delete(messageId);
+        reject(new Error('Request timeout'));
+      }, 10000); // 10 second timeout
+
+      this.requestCallbacks.set(messageId, (response) => {
+        clearTimeout(timeout);
+        if (response.error) {
+          reject(new Error(response.error.message));
+        } else {
+          resolve(response.result);
+        }
+      });
+
+      this.sendToMCP(message);
+    });
+  }
+
   getNextMessageId() {
     return this.messageId++;
   }
@@ -267,37 +348,171 @@ app.get('/mcp/v1/health', (req, res) => {
 });
 
 // SSE endpoint for real-time communication
-app.get('/mcp/v1/sse', (req, res) => {
+app.get('/mcp/v1/sse', async (req, res) => {
+  console.log('SSE connection attempt from:', req.ip);
+  
   // Set SSE headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Cache-Control'
+    'Access-Control-Allow-Headers': 'Cache-Control, mcp-session-id',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
   });
 
   // Get or create session
   let sessionId = req.headers['mcp-session-id'] || uuidv4();
+  console.log(`SSE session: ${sessionId}`);
+  
   let session = sessions.get(sessionId);
   
   if (!session) {
+    console.log(`Creating new MCP session: ${sessionId}`);
     session = new MCPSession(sessionId);
     sessions.set(sessionId, session);
+    
+    // Wait for MCP initialization
+    try {
+      await new Promise((resolve, reject) => {
+        const checkInit = () => {
+          if (session.initialized) {
+            resolve();
+          } else if (session.process?.killed) {
+            reject(new Error('MCP process died'));
+          } else {
+            setTimeout(checkInit, 100);
+          }
+        };
+        checkInit();
+        
+        // Timeout after 10 seconds
+        setTimeout(() => reject(new Error('Initialization timeout')), 10000);
+      });
+    } catch (error) {
+      console.error(`Failed to initialize MCP session ${sessionId}:`, error.message);
+      res.write(`data: ${JSON.stringify({
+        type: 'error',
+        error: error.message
+      })}\n\n`);
+      res.end();
+      return;
+    }
   }
 
   // Add this client to the session
   session.addSSEClient(res);
 
-  // Send session ID in the first message
+  // Send session ID and ready status
   res.write(`data: ${JSON.stringify({
     type: 'session',
-    sessionId: sessionId
+    sessionId: sessionId,
+    initialized: session.initialized
+  })}\n\n`);
+
+  // Send ready event
+  res.write(`data: ${JSON.stringify({
+    type: 'ready'
   })}\n\n`);
 
   req.on('close', () => {
+    console.log(`SSE client disconnected from session ${sessionId}`);
     session.sseClients.delete(res);
   });
+
+  req.on('error', (error) => {
+    console.error(`SSE connection error for session ${sessionId}:`, error.message);
+    session.sseClients.delete(res);
+  });
+});
+
+// Handle MCP JSON-RPC messages via POST
+app.post('/mcp/v1/sse', async (req, res) => {
+  try {
+    console.log('Received MCP message:', req.body);
+    
+    const { jsonrpc, id, method, params } = req.body;
+    
+    if (jsonrpc !== "2.0") {
+      return res.status(400).json({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32600,
+          message: "Invalid Request: jsonrpc version must be 2.0"
+        }
+      });
+    }
+
+    // Get session
+    const sessionId = req.headers['mcp-session-id'] || 'default';
+    let session = sessions.get(sessionId);
+    
+    if (!session) {
+      session = new MCPSession(sessionId);
+      sessions.set(sessionId, session);
+      
+      // Wait for initialization
+      await new Promise((resolve, reject) => {
+        const checkInit = () => {
+          if (session.initialized) {
+            resolve();
+          } else if (session.process?.killed) {
+            reject(new Error('MCP process died'));
+          } else {
+            setTimeout(checkInit, 100);
+          }
+        };
+        checkInit();
+        
+        // Timeout after 5 seconds
+        setTimeout(() => reject(new Error('Initialization timeout')), 5000);
+      });
+    }
+
+    let result;
+
+    // Handle different methods
+    switch (method) {
+      case 'ping':
+        result = await session.ping();
+        break;
+      
+      case 'tools/list':
+        result = await session.listTools();
+        break;
+        
+      case 'tools/call':
+        result = await session.callTool(params.name, params.arguments || params.input || {});
+        break;
+        
+      default:
+        // Forward other methods to the MCP server
+        result = await session.sendMCPMessage(method, params);
+        break;
+    }
+
+    // Send JSON-RPC response
+    res.json({
+      jsonrpc: "2.0",
+      id,
+      result
+    });
+
+  } catch (error) {
+    console.error('Error handling MCP message:', error);
+    
+    const errorResponse = {
+      jsonrpc: "2.0",
+      id: req.body.id,
+      error: {
+        code: -32000,
+        message: error.message
+      }
+    };
+    
+    res.status(500).json(errorResponse);
+  }
 });
 
 // Memory operations endpoints
