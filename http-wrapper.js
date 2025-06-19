@@ -265,7 +265,9 @@ globalMCPSession = new OptimizedMCPSession();
 
 // Health check endpoint
 app.get('/mcp/v1/health', (req, res) => {
-  res.json({
+  debugLog('Health check requested');
+  
+  const healthData = {
     status: 'success',
     data: {
       server: 'MCP Memory Server',
@@ -276,23 +278,38 @@ app.get('/mcp/v1/health', (req, res) => {
       toolsLoaded: globalMCPSession?.tools?.length || 0,
       processRunning: globalMCPSession?.process && !globalMCPSession.process.killed,
       sseClientsConnected: sseClients.size,
-      lastActivity: globalMCPSession?.lastActivity ? new Date(globalMCPSession.lastActivity).toISOString() : null
+      lastActivity: globalMCPSession?.lastActivity ? new Date(globalMCPSession.lastActivity).toISOString() : null,
+      processPid: globalMCPSession?.process?.pid || null,
+      initializationStarted: globalMCPSession?.initializationStarted || false
     }
-  });
+  };
+  
+  infoLog('Health check response', healthData);
+  res.json(healthData);
 });
 
 // Debug endpoint to test ping directly
 app.get('/mcp/v1/debug/ping', async (req, res) => {
+  debugLog('Debug ping requested');
+  
   try {
+    const start = Date.now();
     const result = await globalMCPSession.ping();
-    res.json({
+    const duration = Date.now() - start;
+    
+    const response = {
       status: 'success',
       method: 'ping',
       result: result,
       sessionReady: isGlobalSessionReady,
-      responseTime: Date.now()
-    });
+      responseTime: `${duration}ms`,
+      timestamp: new Date().toISOString()
+    };
+    
+    infoLog('Debug ping response', response);
+    res.json(response);
   } catch (error) {
+    errorLog('Debug ping failed', error);
     res.status(500).json({
       status: 'error',
       error: error.message
@@ -302,16 +319,26 @@ app.get('/mcp/v1/debug/ping', async (req, res) => {
 
 // Debug endpoint to test tools list
 app.get('/mcp/v1/debug/tools', async (req, res) => {
+  debugLog('Debug tools list requested');
+  
   try {
+    const start = Date.now();
     const result = await globalMCPSession.listTools();
-    res.json({
+    const duration = Date.now() - start;
+    
+    const response = {
       status: 'success',
       method: 'tools/list',
       result: result,
       sessionReady: isGlobalSessionReady,
-      responseTime: Date.now()
-    });
+      responseTime: `${duration}ms`,
+      timestamp: new Date().toISOString()
+    };
+    
+    infoLog('Debug tools response', response);
+    res.json(response);
   } catch (error) {
+    errorLog('Debug tools failed', error);
     res.status(500).json({
       status: 'error',
       error: error.message
@@ -319,9 +346,35 @@ app.get('/mcp/v1/debug/tools', async (req, res) => {
   }
 });
 
+// Debug endpoint to check MCP process status
+app.get('/mcp/v1/debug/process', (req, res) => {
+  debugLog('Debug process status requested');
+  
+  const processInfo = {
+    hasProcess: !!globalMCPSession?.process,
+    pid: globalMCPSession?.process?.pid || null,
+    killed: globalMCPSession?.process?.killed || null,
+    exitCode: globalMCPSession?.process?.exitCode || null,
+    signalCode: globalMCPSession?.process?.signalCode || null,
+    initialized: globalMCPSession?.initialized || false,
+    initializationStarted: globalMCPSession?.initializationStarted || false,
+    sessionReady: isGlobalSessionReady,
+    toolsLoaded: globalMCPSession?.tools?.length || 0,
+    lastActivity: globalMCPSession?.lastActivity ? new Date(globalMCPSession.lastActivity).toISOString() : null,
+    pendingCallbacks: globalMCPSession?.requestCallbacks?.size || 0
+  };
+  
+  infoLog('Process status', processInfo);
+  res.json(processInfo);
+});
+
 // SSE endpoint for real-time communication
 app.get('/mcp/v1/sse', async (req, res) => {
-  console.log('SSE connection from:', req.ip);
+  infoLog('SSE connection attempt', {
+    ip: req.ip,
+    userAgent: req.get('User-Agent'),
+    headers: req.headers
+  });
   
   // Set SSE headers immediately
   res.writeHead(200, {
@@ -335,36 +388,53 @@ app.get('/mcp/v1/sse', async (req, res) => {
 
   // Add to SSE clients
   sseClients.add(res);
-  console.log('SSE clients connected:', sseClients.size);
+  infoLog('SSE client added', { totalClients: sseClients.size });
 
   // Send initial connection event like the Snowflake server
-  res.write(`event: open\n`);
-  res.write(`data: ${JSON.stringify({
-    protocol: "mcp",
-    version: "1.0.0",
-    capabilities: {
-      tools: true
-    }
-  })}\n\n`);
+  try {
+    const openEvent = {
+      protocol: "mcp",
+      version: "1.0.0",
+      capabilities: {
+        tools: true
+      }
+    };
+    
+    res.write(`event: open\n`);
+    res.write(`data: ${JSON.stringify(openEvent)}\n\n`);
+    debugLog('Sent open event to SSE client', openEvent);
 
-  // Send ready status if initialized
-  if (isGlobalSessionReady) {
-    res.write(`event: ready\n`);
-    res.write(`data: ${JSON.stringify({
-      type: "ready",
-      tools: globalMCPSession?.tools?.length || 0
-    })}\n\n`);
+    // Send ready status if initialized
+    if (isGlobalSessionReady) {
+      const readyEvent = {
+        type: "ready",
+        tools: globalMCPSession?.tools?.length || 0
+      };
+      
+      res.write(`event: ready\n`);
+      res.write(`data: ${JSON.stringify(readyEvent)}\n\n`);
+      debugLog('Sent ready event to SSE client', readyEvent);
+    } else {
+      debugLog('Session not ready, skipping ready event');
+    }
+  } catch (error) {
+    errorLog('Failed to send initial SSE events', error);
   }
 
   // Heartbeat every 30 seconds like the Snowflake server
   const heartbeat = setInterval(() => {
     if (sseClients.has(res)) {
       try {
+        const pingEvent = {
+          type: "ping",
+          timestamp: new Date().toISOString()
+        };
+        
         res.write(`event: ping\n`);
-        res.write(`data: ${JSON.stringify({
-          type: "ping"
-        })}\n\n`);
+        res.write(`data: ${JSON.stringify(pingEvent)}\n\n`);
+        debugLog('Sent heartbeat ping to SSE client');
       } catch (error) {
+        errorLog('Failed to send heartbeat', error);
         clearInterval(heartbeat);
         sseClients.delete(res);
       }
@@ -376,13 +446,13 @@ app.get('/mcp/v1/sse', async (req, res) => {
   req.on('close', () => {
     clearInterval(heartbeat);
     sseClients.delete(res);
-    console.log('SSE client disconnected. Remaining:', sseClients.size);
+    infoLog('SSE client disconnected', { remainingClients: sseClients.size });
   });
 
   req.on('error', (error) => {
     clearInterval(heartbeat);
     sseClients.delete(res);
-    console.error('SSE connection error:', error.message);
+    errorLog('SSE connection error', error);
   });
 });
 
@@ -390,20 +460,30 @@ app.get('/mcp/v1/sse', async (req, res) => {
 app.post('/mcp/v1/sse', async (req, res) => {
   const startTime = Date.now();
   
+  infoLog('MCP JSON-RPC message received', {
+    method: req.body?.method,
+    id: req.body?.id,
+    hasParams: !!req.body?.params,
+    bodySize: JSON.stringify(req.body || {}).length
+  });
+  
   try {
-    console.log('MCP message received:', req.body.method, 'id:', req.body.id);
+    debugLog('Full request body', req.body);
     
     const { jsonrpc, id, method, params } = req.body;
     
     if (jsonrpc !== "2.0") {
-      return res.json({
+      const errorResponse = {
         jsonrpc: "2.0",
         id,
         error: {
           code: -32600,
           message: "Invalid Request: jsonrpc version must be 2.0"
         }
-      });
+      };
+      
+      errorLog('Invalid JSON-RPC version', { received: jsonrpc, expected: "2.0" });
+      return res.json(errorResponse);
     }
 
     let result;
@@ -411,6 +491,7 @@ app.post('/mcp/v1/sse', async (req, res) => {
     // Handle methods with immediate responses
     switch (method) {
       case 'initialize':
+        debugLog('Handling initialize request', params);
         result = {
           protocolVersion: "2024-11-05",
           capabilities: {
@@ -430,12 +511,13 @@ app.post('/mcp/v1/sse', async (req, res) => {
             version: "1.0.0"
           }
         };
-        console.log(`Initialize responded in ${Date.now() - startTime}ms`);
+        infoLog(`Initialize handled in ${Date.now() - startTime}ms`);
         break;
 
       case 'ping':
+        debugLog('Handling ping request');
         // Respond immediately for ping - no need to wait for MCP process
-        console.log(`Ping responded in ${Date.now() - startTime}ms`);
+        infoLog(`Ping handled in ${Date.now() - startTime}ms`);
         return res.json({
           jsonrpc: "2.0",
           id
@@ -443,6 +525,11 @@ app.post('/mcp/v1/sse', async (req, res) => {
         });
       
       case 'tools/list':
+        debugLog('Handling tools/list request', {
+          sessionReady: isGlobalSessionReady,
+          toolsAvailable: globalMCPSession?.tools?.length || 0
+        });
+        
         // Return cached tools immediately
         result = {
           tools: globalMCPSession?.tools || [
@@ -488,10 +575,18 @@ app.post('/mcp/v1/sse', async (req, res) => {
             }
           ]
         };
-        console.log(`Tools list responded in ${Date.now() - startTime}ms with ${result.tools.length} tools`);
+        infoLog(`Tools list handled in ${Date.now() - startTime}ms`, {
+          toolCount: result.tools.length
+        });
         break;
         
       case 'tools/call':
+        debugLog('Handling tools/call request', {
+          toolName: params?.name,
+          sessionReady: isGlobalSessionReady,
+          hasArguments: !!params?.arguments
+        });
+        
         if (!isGlobalSessionReady) {
           throw new Error('MCP session not ready');
         }
@@ -507,15 +602,17 @@ app.post('/mcp/v1/sse', async (req, res) => {
             }
           ]
         };
-        console.log(`Tool call ${params.name} responded in ${Date.now() - startTime}ms`);
+        infoLog(`Tool call ${params.name} handled in ${Date.now() - startTime}ms`);
         break;
 
       case 'notifications/initialized':
+        debugLog('Handling notifications/initialized');
         // This is a notification, no response needed
-        console.log('Received initialized notification');
+        infoLog('Received initialized notification');
         return res.status(204).send(); // No content response
         
       default:
+        errorLog('Unsupported method', { method, availableMethods: ['initialize', 'ping', 'tools/list', 'tools/call', 'notifications/initialized'] });
         throw new Error(`Unsupported method: ${method}`);
     }
 
@@ -526,14 +623,15 @@ app.post('/mcp/v1/sse', async (req, res) => {
       result
     };
     
+    debugLog('Sending JSON-RPC response', response);
     res.json(response);
 
   } catch (error) {
-    console.error(`Error handling ${req.body.method}:`, error.message);
+    errorLog(`Error handling MCP method ${req.body?.method}`, error);
     
     const errorResponse = {
       jsonrpc: "2.0",
-      id: req.body.id || null,
+      id: req.body?.id || null,
       error: {
         code: -32000,
         message: error.message
