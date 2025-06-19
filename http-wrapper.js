@@ -416,6 +416,7 @@ app.get('/mcp/v1/sse', async (req, res) => {
     sseClients.add(res);
     infoLog('SSE client added', { totalClients: sseClients.size });
 
+    // Send initial connection event exactly like Snowflake server
     const openEvent = {
       protocol: "mcp",
       version: "1.0.0",
@@ -428,17 +429,28 @@ app.get('/mcp/v1/sse', async (req, res) => {
     res.write(`data: ${JSON.stringify(openEvent)}\n\n`);
     debugLog('Sent open event to SSE client', openEvent);
 
-    if (isGlobalSessionReady) {
-      const readyEvent = {
-        type: "ready",
-        tools: globalMCPSession?.tools?.length || 0
+    // Send tools immediately to mimic working servers
+    if (isGlobalSessionReady && globalMCPSession?.tools?.length > 0) {
+      const toolsEvent = {
+        tools: globalMCPSession.tools
       };
       
-      res.write(`event: ready\n`);
-      res.write(`data: ${JSON.stringify(readyEvent)}\n\n`);
-      debugLog('Sent ready event to SSE client', readyEvent);
+      res.write(`event: tools\n`);
+      res.write(`data: ${JSON.stringify(toolsEvent)}\n\n`);
+      debugLog('Sent tools event to SSE client', { toolCount: globalMCPSession.tools.length });
+      
+      // Also send capabilities
+      const capabilitiesEvent = {
+        tools: {
+          listChanged: false
+        }
+      };
+      
+      res.write(`event: capabilities\n`);
+      res.write(`data: ${JSON.stringify(capabilitiesEvent)}\n\n`);
+      debugLog('Sent capabilities event to SSE client', capabilitiesEvent);
     } else {
-      debugLog('Session not ready, skipping ready event');
+      debugLog('Session not ready or no tools, skipping tools event');
     }
 
     const heartbeat = setInterval(() => {
@@ -484,7 +496,7 @@ app.get('/mcp/v1/sse', async (req, res) => {
 app.post('/mcp/v1/sse', async (req, res) => {
   const startTime = Date.now();
   
-  infoLog('MCP JSON-RPC message received', {
+  infoLog('MCP JSON-RPC message received via POST /mcp/v1/sse', {
     method: req.body?.method,
     id: req.body?.id,
     hasParams: !!req.body?.params,
@@ -657,6 +669,40 @@ app.post('/mcp/v1/sse', async (req, res) => {
     
     res.json(errorResponse);
   }
+});
+
+// Alternative endpoints that LibreChat might be trying
+app.post('/mcp', async (req, res) => {
+  infoLog('MCP JSON-RPC message received via POST /mcp', {
+    method: req.body?.method,
+    id: req.body?.id
+  });
+  
+  // Forward to the main handler
+  req.url = '/mcp/v1/sse';
+  return app._router.handle(req, res);
+});
+
+app.post('/sse', async (req, res) => {
+  infoLog('MCP JSON-RPC message received via POST /sse', {
+    method: req.body?.method,
+    id: req.body?.id
+  });
+  
+  // Forward to the main handler
+  req.url = '/mcp/v1/sse';
+  return app._router.handle(req, res);
+});
+
+app.post('/messages', async (req, res) => {
+  infoLog('MCP JSON-RPC message received via POST /messages', {
+    method: req.body?.method,
+    id: req.body?.id
+  });
+  
+  // Forward to the main handler  
+  req.url = '/mcp/v1/sse';
+  return app._router.handle(req, res);
 });
 
 // Start the HTTP server
