@@ -222,12 +222,12 @@ class OptimizedMCPSession {
 
   async ping() {
     // Always respond immediately to ping
-    return { pong: true };
+    return true; // Just return true, not an object
   }
 
   async listTools() {
-    // Return cached tools for immediate response
-    return { tools: this.tools };
+    // Return tools directly, not wrapped in an object
+    return this.tools || [];
   }
 
   async callTool(toolName, args) {
@@ -273,9 +273,50 @@ app.get('/mcp/v1/health', (req, res) => {
       timestamp: new Date().toISOString(),
       sessionReady: isGlobalSessionReady,
       initialized: globalMCPSession?.initialized || false,
-      toolsLoaded: globalMCPSession?.tools?.length || 0
+      toolsLoaded: globalMCPSession?.tools?.length || 0,
+      processRunning: globalMCPSession?.process && !globalMCPSession.process.killed,
+      sseClientsConnected: sseClients.size,
+      lastActivity: globalMCPSession?.lastActivity ? new Date(globalMCPSession.lastActivity).toISOString() : null
     }
   });
+});
+
+// Debug endpoint to test ping directly
+app.get('/mcp/v1/debug/ping', async (req, res) => {
+  try {
+    const result = await globalMCPSession.ping();
+    res.json({
+      status: 'success',
+      method: 'ping',
+      result: result,
+      sessionReady: isGlobalSessionReady,
+      responseTime: Date.now()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      error: error.message
+    });
+  }
+});
+
+// Debug endpoint to test tools list
+app.get('/mcp/v1/debug/tools', async (req, res) => {
+  try {
+    const result = await globalMCPSession.listTools();
+    res.json({
+      status: 'success',
+      method: 'tools/list',
+      result: result,
+      sessionReady: isGlobalSessionReady,
+      responseTime: Date.now()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      error: error.message
+    });
+  }
 });
 
 // SSE endpoint for real-time communication
@@ -296,29 +337,32 @@ app.get('/mcp/v1/sse', async (req, res) => {
   sseClients.add(res);
   console.log('SSE clients connected:', sseClients.size);
 
-  // Send immediate connection confirmation
+  // Send initial connection event like the Snowflake server
+  res.write(`event: open\n`);
   res.write(`data: ${JSON.stringify({
-    type: 'connected',
-    sessionId: 'global',
-    initialized: isGlobalSessionReady,
-    timestamp: new Date().toISOString()
+    protocol: "mcp",
+    version: "1.0.0",
+    capabilities: {
+      tools: true
+    }
   })}\n\n`);
 
-  // Send ready status
+  // Send ready status if initialized
   if (isGlobalSessionReady) {
+    res.write(`event: ready\n`);
     res.write(`data: ${JSON.stringify({
-      type: 'ready',
-      tools: globalMCPSession.tools.length
+      type: "ready",
+      tools: globalMCPSession?.tools?.length || 0
     })}\n\n`);
   }
 
-  // Heartbeat every 30 seconds
+  // Heartbeat every 30 seconds like the Snowflake server
   const heartbeat = setInterval(() => {
     if (sseClients.has(res)) {
       try {
+        res.write(`event: ping\n`);
         res.write(`data: ${JSON.stringify({
-          type: 'heartbeat',
-          timestamp: new Date().toISOString()
+          type: "ping"
         })}\n\n`);
       } catch (error) {
         clearInterval(heartbeat);
@@ -352,7 +396,7 @@ app.post('/mcp/v1/sse', async (req, res) => {
     const { jsonrpc, id, method, params } = req.body;
     
     if (jsonrpc !== "2.0") {
-      return res.status(400).json({
+      return res.json({
         jsonrpc: "2.0",
         id,
         error: {
@@ -366,13 +410,84 @@ app.post('/mcp/v1/sse', async (req, res) => {
 
     // Handle methods with immediate responses
     switch (method) {
-      case 'ping':
-        result = await globalMCPSession.ping();
-        console.log(`Ping responded in ${Date.now() - startTime}ms`);
+      case 'initialize':
+        result = {
+          protocolVersion: "2024-11-05",
+          capabilities: {
+            tools: {
+              listChanged: false
+            },
+            resources: {
+              listChanged: false,
+              subscribe: false
+            },
+            prompts: {
+              listChanged: false
+            }
+          },
+          serverInfo: {
+            name: "memory",
+            version: "1.0.0"
+          }
+        };
+        console.log(`Initialize responded in ${Date.now() - startTime}ms`);
         break;
+
+      case 'ping':
+        // Respond immediately for ping - no need to wait for MCP process
+        console.log(`Ping responded in ${Date.now() - startTime}ms`);
+        return res.json({
+          jsonrpc: "2.0",
+          id
+          // Ping responses don't need a result field, just the acknowledgment
+        });
       
       case 'tools/list':
-        result = await globalMCPSession.listTools();
+        // Return cached tools immediately
+        result = {
+          tools: globalMCPSession?.tools || [
+            {
+              name: "memory.create",
+              description: "Create a new memory entry",
+              inputSchema: {
+                type: "object",
+                required: ["type", "content", "source", "confidence"],
+                properties: {
+                  type: { type: "string", description: "Type of memory" },
+                  content: { type: "object", description: "Content to store" },
+                  source: { type: "string", description: "Source of the memory" },
+                  tags: { type: "array", items: { type: "string" }, description: "Optional tags" },
+                  confidence: { type: "number", description: "Confidence score between 0 and 1" }
+                }
+              }
+            },
+            {
+              name: "memory.search",
+              description: "Search for memories using semantic similarity",
+              inputSchema: {
+                type: "object",
+                required: ["query"],
+                properties: {
+                  query: { type: "string", description: "Search query" },
+                  type: { type: "string", description: "Optional type filter" },
+                  tags: { type: "array", items: { type: "string" }, description: "Optional tags filter" },
+                  limit: { type: "number", description: "Maximum number of results to return" }
+                }
+              }
+            },
+            {
+              name: "memory.list",
+              description: "List all memories",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  type: { type: "string", description: "Optional type filter" },
+                  tags: { type: "array", items: { type: "string" }, description: "Optional tags filter" }
+                }
+              }
+            }
+          ]
+        };
         console.log(`Tools list responded in ${Date.now() - startTime}ms with ${result.tools.length} tools`);
         break;
         
@@ -380,9 +495,25 @@ app.post('/mcp/v1/sse', async (req, res) => {
         if (!isGlobalSessionReady) {
           throw new Error('MCP session not ready');
         }
-        result = await globalMCPSession.callTool(params.name, params.arguments || params.input || {});
+        
+        const toolResult = await globalMCPSession.callTool(params.name, params.arguments || params.input || {});
+        
+        // Format response like the Snowflake server
+        result = {
+          content: [
+            {
+              type: "text", 
+              text: JSON.stringify(toolResult)
+            }
+          ]
+        };
         console.log(`Tool call ${params.name} responded in ${Date.now() - startTime}ms`);
         break;
+
+      case 'notifications/initialized':
+        // This is a notification, no response needed
+        console.log('Received initialized notification');
+        return res.status(204).send(); // No content response
         
       default:
         throw new Error(`Unsupported method: ${method}`);
@@ -402,14 +533,14 @@ app.post('/mcp/v1/sse', async (req, res) => {
     
     const errorResponse = {
       jsonrpc: "2.0",
-      id: req.body.id,
+      id: req.body.id || null,
       error: {
         code: -32000,
         message: error.message
       }
     };
     
-    res.status(500).json(errorResponse);
+    res.json(errorResponse);
   }
 });
 
