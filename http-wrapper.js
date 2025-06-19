@@ -810,6 +810,155 @@ app.post('/messages', async (req, res) => {
   return app._router.handle(req, res);
 });
 
+// Add specific debug endpoint that mimics exactly how working servers respond
+app.get('/debug/test-sse', (req, res) => {
+  infoLog('Debug SSE test endpoint hit');
+  
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*'
+  });
+
+  // Send the exact same events as the working Snowflake server
+  res.write(`event: open\n`);
+  res.write(`data: ${JSON.stringify({
+    protocol: "mcp",
+    version: "1.0.0",
+    capabilities: { tools: true }
+  })}\n\n`);
+
+  // Keep connection alive and wait for client behavior
+  const interval = setInterval(() => {
+    res.write(`event: ping\n`);
+    res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`);
+  }, 30000);
+
+  req.on('close', () => {
+    clearInterval(interval);
+    infoLog('Debug SSE client disconnected');
+  });
+});
+
+// Try to handle MCP at the root level like some servers do
+app.get('/mcp', (req, res) => {
+  infoLog('GET request to /mcp root', {
+    headers: req.headers,
+    query: req.query
+  });
+  
+  // Maybe LibreChat expects MCP protocol negotiation here
+  res.json({
+    name: "memory",
+    version: "1.0.0",
+    description: "MCP Memory Server",
+    capabilities: {
+      tools: true,
+      resources: false,
+      prompts: false
+    },
+    sse_endpoint: "/mcp/v1/sse",
+    messages_endpoint: "/mcp/v1/messages"
+  });
+});
+
+// Try alternative root endpoint
+app.get('/', (req, res) => {
+  infoLog('GET request to root /', {
+    headers: req.headers,
+    query: req.query
+  });
+  
+  res.json({
+    server: "MCP Memory Server",
+    version: "1.0.0",
+    status: "ready",
+    endpoints: {
+      health: "/mcp/v1/health",
+      sse: "/mcp/v1/sse", 
+      messages: "/mcp/v1/messages"
+    },
+    capabilities: {
+      tools: globalMCPSession?.tools?.length || 0
+    }
+  });
+});
+
+// Maybe LibreChat is trying to use the new Streamable HTTP transport
+// which uses the same endpoint for both SSE and POST
+app.post('/mcp/v1/sse', async (req, res) => {
+  infoLog('POST request to SSE endpoint - Streamable HTTP style', {
+    method: req.body?.method,
+    id: req.body?.id,
+    contentType: req.headers['content-type']
+  });
+
+  // Check if this is a JSON-RPC request or SSE setup
+  if (req.headers['content-type']?.includes('application/json')) {
+    // Handle as JSON-RPC
+    const startTime = Date.now();
+    
+    try {
+      const { jsonrpc, id, method, params } = req.body;
+      
+      if (method === 'ping') {
+        infoLog(`Streamable HTTP ping handled in ${Date.now() - startTime}ms`);
+        return res.json({
+          jsonrpc: "2.0",
+          id
+        });
+      }
+      
+      if (method === 'tools/list') {
+        const result = {
+          tools: globalMCPSession?.tools || []
+        };
+        infoLog(`Streamable HTTP tools/list handled in ${Date.now() - startTime}ms`, {
+          toolCount: result.tools.length
+        });
+        return res.json({
+          jsonrpc: "2.0",
+          id,
+          result
+        });
+      }
+
+      // For other methods, forward to our main handler
+      req.url = '/mcp/v1/messages';
+      return app._router.handle(req, res);
+      
+    } catch (error) {
+      errorLog('Streamable HTTP error', error);
+      return res.json({
+        jsonrpc: "2.0",
+        id: req.body?.id || null,
+        error: {
+          code: -32000,
+          message: error.message
+        }
+      });
+    }
+  } else {
+    // Treat as SSE setup request - respond with SSE stream
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+
+    res.write(`event: open\n`);
+    res.write(`data: ${JSON.stringify({
+      protocol: "mcp",
+      version: "1.0.0"
+    })}\n\n`);
+
+    req.on('close', () => {
+      infoLog('Streamable HTTP SSE connection closed');
+    });
+  }
+});
+
 // Debug endpoint to test what URLs LibreChat might be trying
 app.all('*', (req, res, next) => {
   // Only log unhandled routes
@@ -821,6 +970,21 @@ app.all('*', (req, res, next) => {
       headers: req.headers,
       body: req.body
     });
+    
+    // For unhandled routes, return a helpful response
+    res.status(404).json({
+      error: 'Route not found',
+      method: req.method,
+      path: req.path,
+      availableEndpoints: [
+        'GET /mcp/v1/health',
+        'GET /mcp/v1/sse',
+        'POST /mcp/v1/messages',
+        'POST /mcp/v1/sse',
+        'GET /debug/test-sse'
+      ]
+    });
+    return;
   }
   next();
 });
@@ -831,7 +995,8 @@ app.listen(PORT, '0.0.0.0', () => {
     port: PORT,
     healthCheck: `http://localhost:${PORT}/mcp/v1/health`,
     sseEndpoint: `http://localhost:${PORT}/mcp/v1/sse`,
-    messagesEndpoint: `http://localhost:${PORT}/mcp/v1/messages`
+    messagesEndpoint: `http://localhost:${PORT}/mcp/v1/messages`,
+    debugSSE: `http://localhost:${PORT}/debug/test-sse`
   });
 });
 
