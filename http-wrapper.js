@@ -1,4 +1,4 @@
-// http-wrapper.js - HTTP/SSE wrapper for the MCP stdio server
+// http-wrapper.js - Optimized HTTP/SSE wrapper for MCP stdio server
 import express from 'express';
 import cors from 'cors';
 import { spawn } from 'child_process';
@@ -29,24 +29,25 @@ app.options('*', (req, res) => {
   res.sendStatus(200);
 });
 
-// Store active MCP sessions
-const sessions = new Map();
+// Pre-initialize a global MCP session for immediate responses
+let globalMCPSession = null;
+let isGlobalSessionReady = false;
+const sseClients = new Set();
 
-class MCPSession {
-  constructor(sessionId) {
-    this.sessionId = sessionId;
+class OptimizedMCPSession {
+  constructor() {
     this.process = null;
     this.initialized = false;
-    this.messageQueue = [];
-    this.sseClients = new Set();
     this.requestCallbacks = new Map();
     this.messageId = 1;
+    this.tools = [];
+    this.lastActivity = Date.now();
     
     this.startMCPProcess();
   }
 
   startMCPProcess() {
-    console.log(`Starting MCP process for session ${this.sessionId}`);
+    console.log('Starting global MCP process...');
     
     // Spawn the MCP server process
     this.process = spawn('node', [path.join(__dirname, 'src/server.js')], {
@@ -75,13 +76,9 @@ class MCPSession {
       for (const line of lines) {
         try {
           const logMessage = JSON.parse(line);
-          // Forward logs to SSE clients
-          this.broadcastToSSE({
-            type: 'log',
-            data: logMessage
-          });
+          console.log('MCP log:', logMessage);
         } catch (error) {
-          // Non-JSON stderr output, just log it
+          // Non-JSON stderr output
           console.log('MCP stderr:', line);
         }
       }
@@ -89,8 +86,16 @@ class MCPSession {
 
     // Handle process exit
     this.process.on('exit', (code) => {
-      console.log(`MCP process exited with code ${code} for session ${this.sessionId}`);
-      this.cleanup();
+      console.log(`MCP process exited with code ${code}`);
+      this.initialized = false;
+      isGlobalSessionReady = false;
+      
+      // Restart process after a delay
+      setTimeout(() => {
+        if (globalMCPSession === this) {
+          this.startMCPProcess();
+        }
+      }, 5000);
     });
 
     // Initialize the MCP server
@@ -98,6 +103,8 @@ class MCPSession {
   }
 
   async initializeMCP() {
+    console.log('Initializing MCP session...');
+    
     const initMessage = {
       jsonrpc: "2.0",
       id: this.getNextMessageId(),
@@ -116,25 +123,45 @@ class MCPSession {
       }
     };
 
-    return new Promise((resolve, reject) => {
-      this.requestCallbacks.set(initMessage.id, (response) => {
-        if (response.error) {
-          reject(new Error(response.error.message));
-        } else {
-          this.initialized = true;
-          
-          // Send initialized notification
-          this.sendToMCP({
-            jsonrpc: "2.0",
-            method: "initialized"
-          });
-          
-          resolve(response.result);
-        }
+    try {
+      const result = await this.sendMCPMessage(initMessage);
+      console.log('MCP initialization successful:', result);
+      
+      // Send initialized notification
+      this.sendToMCP({
+        jsonrpc: "2.0",
+        method: "notifications/initialized"
       });
 
-      this.sendToMCP(initMessage);
-    });
+      this.initialized = true;
+      
+      // Pre-load tools list for fast responses
+      await this.loadTools();
+      
+      isGlobalSessionReady = true;
+      console.log('Global MCP session ready with tools:', this.tools.map(t => t.name));
+      
+    } catch (error) {
+      console.error('MCP initialization failed:', error.message);
+      setTimeout(() => this.initializeMCP(), 2000);
+    }
+  }
+
+  async loadTools() {
+    try {
+      const message = {
+        jsonrpc: "2.0",
+        id: this.getNextMessageId(),
+        method: "tools/list"
+      };
+      
+      const result = await this.sendMCPMessage(message);
+      this.tools = result.tools || [];
+      console.log('Loaded tools:', this.tools.length);
+    } catch (error) {
+      console.error('Failed to load tools:', error.message);
+      this.tools = [];
+    }
   }
 
   sendToMCP(message) {
@@ -143,160 +170,14 @@ class MCPSession {
     }
   }
 
-  handleMCPMessage(message) {
-    // Handle responses to our requests
-    if (message.id && this.requestCallbacks.has(message.id)) {
-      const callback = this.requestCallbacks.get(message.id);
-      this.requestCallbacks.delete(message.id);
-      callback(message);
-      return;
-    }
-
-    // Handle notifications and other messages
-    this.broadcastToSSE({
-      type: 'message',
-      data: message
-    });
-  }
-
-  broadcastToSSE(data) {
-    const sseData = `data: ${JSON.stringify(data)}\n\n`;
-    
-    for (const client of this.sseClients) {
-      try {
-        client.write(sseData);
-      } catch (error) {
-        // Remove disconnected clients
-        this.sseClients.delete(client);
-      }
-    }
-  }
-
-  addSSEClient(res) {
-    this.sseClients.add(res);
-    
-    // Send connection established message
-    res.write(`data: ${JSON.stringify({
-      type: 'connected',
-      sessionId: this.sessionId,
-      initialized: this.initialized
-    })}\n\n`);
-
-    // Send heartbeat every 30 seconds to keep connection alive
-    const heartbeat = setInterval(() => {
-      if (this.sseClients.has(res)) {
-        try {
-          res.write(`data: ${JSON.stringify({
-            type: 'heartbeat',
-            timestamp: new Date().toISOString()
-          })}\n\n`);
-        } catch (error) {
-          clearInterval(heartbeat);
-          this.sseClients.delete(res);
-        }
-      } else {
-        clearInterval(heartbeat);
-      }
-    }, 30000);
-
-    res.on('close', () => {
-      clearInterval(heartbeat);
-      this.sseClients.delete(res);
-      console.log(`SSE client disconnected from session ${this.sessionId}`);
-    });
-
-    res.on('error', (error) => {
-      clearInterval(heartbeat);
-      this.sseClients.delete(res);
-      console.error(`SSE client error in session ${this.sessionId}:`, error.message);
-    });
-  }
-
-  async callTool(toolName, args) {
-    if (!this.initialized) {
-      throw new Error('MCP session not initialized');
-    }
-
-    const messageId = this.getNextMessageId();
-    const message = {
-      jsonrpc: "2.0",
-      id: messageId,
-      method: "tools/call",
-      params: {
-        name: toolName,
-        arguments: args
-      }
-    };
-
-    return new Promise((resolve, reject) => {
-      this.requestCallbacks.set(messageId, (response) => {
-        if (response.error) {
-          reject(new Error(response.error.message));
-        } else {
-          resolve(response.result);
-        }
-      });
-
-      this.sendToMCP(message);
-    });
-  }
-
-  async listTools() {
-    if (!this.initialized) {
-      throw new Error('MCP session not initialized');
-    }
-
-    const messageId = this.getNextMessageId();
-    const message = {
-      jsonrpc: "2.0",
-      id: messageId,
-      method: "tools/list"
-    };
-
-    return new Promise((resolve, reject) => {
-      this.requestCallbacks.set(messageId, (response) => {
-        if (response.error) {
-          reject(new Error(response.error.message));
-        } else {
-          resolve(response.result);
-        }
-      });
-
-      this.sendToMCP(message);
-    });
-  }
-
-  async ping() {
-    // For ping, we can respond immediately without going to the MCP server
-    // since the HTTP wrapper itself is the connection indicator
-    return { pong: true };
-  }
-
-  async sendMCPMessage(method, params = {}) {
-    if (!this.initialized && method !== 'ping') {
-      throw new Error('MCP session not initialized');
-    }
-
-    // Handle ping locally
-    if (method === 'ping') {
-      return { pong: true };
-    }
-
-    const messageId = this.getNextMessageId();
-    const message = {
-      jsonrpc: "2.0",
-      id: messageId,
-      method: method,
-      params: params
-    };
-
+  sendMCPMessage(message) {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.requestCallbacks.delete(messageId);
+        this.requestCallbacks.delete(message.id);
         reject(new Error('Request timeout'));
-      }, 10000); // 10 second timeout
+      }, 5000);
 
-      this.requestCallbacks.set(messageId, (response) => {
+      this.requestCallbacks.set(message.id, (response) => {
         clearTimeout(timeout);
         if (response.error) {
           reject(new Error(response.error.message));
@@ -309,30 +190,78 @@ class MCPSession {
     });
   }
 
+  handleMCPMessage(message) {
+    this.lastActivity = Date.now();
+    
+    // Handle responses to our requests
+    if (message.id && this.requestCallbacks.has(message.id)) {
+      const callback = this.requestCallbacks.get(message.id);
+      this.requestCallbacks.delete(message.id);
+      callback(message);
+      return;
+    }
+
+    // Handle notifications - broadcast to SSE clients
+    this.broadcastToSSE({
+      type: 'message',
+      data: message
+    });
+  }
+
+  broadcastToSSE(data) {
+    const sseData = `data: ${JSON.stringify(data)}\n\n`;
+    
+    for (const client of sseClients) {
+      try {
+        client.write(sseData);
+      } catch (error) {
+        sseClients.delete(client);
+      }
+    }
+  }
+
+  async ping() {
+    // Always respond immediately to ping
+    return { pong: true };
+  }
+
+  async listTools() {
+    // Return cached tools for immediate response
+    return { tools: this.tools };
+  }
+
+  async callTool(toolName, args) {
+    if (!this.initialized) {
+      throw new Error('MCP session not ready');
+    }
+
+    const message = {
+      jsonrpc: "2.0",
+      id: this.getNextMessageId(),
+      method: "tools/call",
+      params: {
+        name: toolName,
+        arguments: args
+      }
+    };
+
+    return await this.sendMCPMessage(message);
+  }
+
   getNextMessageId() {
     return this.messageId++;
   }
 
   cleanup() {
-    // Close all SSE connections
-    for (const client of this.sseClients) {
-      try {
-        client.end();
-      } catch (error) {
-        // Ignore errors when closing
-      }
-    }
-    this.sseClients.clear();
-
-    // Clean up process
     if (this.process && !this.process.killed) {
       this.process.kill();
     }
-
-    // Remove from sessions map
-    sessions.delete(this.sessionId);
   }
 }
+
+// Initialize global session immediately on startup
+console.log('Initializing global MCP session...');
+globalMCPSession = new OptimizedMCPSession();
 
 // Health check endpoint
 app.get('/mcp/v1/health', (req, res) => {
@@ -342,16 +271,18 @@ app.get('/mcp/v1/health', (req, res) => {
       server: 'MCP Memory Server',
       version: '1.0.0',
       timestamp: new Date().toISOString(),
-      activeSessions: sessions.size
+      sessionReady: isGlobalSessionReady,
+      initialized: globalMCPSession?.initialized || false,
+      toolsLoaded: globalMCPSession?.tools?.length || 0
     }
   });
 });
 
 // SSE endpoint for real-time communication
 app.get('/mcp/v1/sse', async (req, res) => {
-  console.log('SSE connection attempt from:', req.ip);
+  console.log('SSE connection from:', req.ip);
   
-  // Set SSE headers
+  // Set SSE headers immediately
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -361,75 +292,62 @@ app.get('/mcp/v1/sse', async (req, res) => {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
   });
 
-  // Get or create session
-  let sessionId = req.headers['mcp-session-id'] || uuidv4();
-  console.log(`SSE session: ${sessionId}`);
-  
-  let session = sessions.get(sessionId);
-  
-  if (!session) {
-    console.log(`Creating new MCP session: ${sessionId}`);
-    session = new MCPSession(sessionId);
-    sessions.set(sessionId, session);
-    
-    // Wait for MCP initialization
-    try {
-      await new Promise((resolve, reject) => {
-        const checkInit = () => {
-          if (session.initialized) {
-            resolve();
-          } else if (session.process?.killed) {
-            reject(new Error('MCP process died'));
-          } else {
-            setTimeout(checkInit, 100);
-          }
-        };
-        checkInit();
-        
-        // Timeout after 10 seconds
-        setTimeout(() => reject(new Error('Initialization timeout')), 10000);
-      });
-    } catch (error) {
-      console.error(`Failed to initialize MCP session ${sessionId}:`, error.message);
-      res.write(`data: ${JSON.stringify({
-        type: 'error',
-        error: error.message
-      })}\n\n`);
-      res.end();
-      return;
-    }
+  // Add to SSE clients
+  sseClients.add(res);
+  console.log('SSE clients connected:', sseClients.size);
+
+  // Send immediate connection confirmation
+  res.write(`data: ${JSON.stringify({
+    type: 'connected',
+    sessionId: 'global',
+    initialized: isGlobalSessionReady,
+    timestamp: new Date().toISOString()
+  })}\n\n`);
+
+  // Send ready status
+  if (isGlobalSessionReady) {
+    res.write(`data: ${JSON.stringify({
+      type: 'ready',
+      tools: globalMCPSession.tools.length
+    })}\n\n`);
   }
 
-  // Add this client to the session
-  session.addSSEClient(res);
-
-  // Send session ID and ready status
-  res.write(`data: ${JSON.stringify({
-    type: 'session',
-    sessionId: sessionId,
-    initialized: session.initialized
-  })}\n\n`);
-
-  // Send ready event
-  res.write(`data: ${JSON.stringify({
-    type: 'ready'
-  })}\n\n`);
+  // Heartbeat every 30 seconds
+  const heartbeat = setInterval(() => {
+    if (sseClients.has(res)) {
+      try {
+        res.write(`data: ${JSON.stringify({
+          type: 'heartbeat',
+          timestamp: new Date().toISOString()
+        })}\n\n`);
+      } catch (error) {
+        clearInterval(heartbeat);
+        sseClients.delete(res);
+      }
+    } else {
+      clearInterval(heartbeat);
+    }
+  }, 30000);
 
   req.on('close', () => {
-    console.log(`SSE client disconnected from session ${sessionId}`);
-    session.sseClients.delete(res);
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+    console.log('SSE client disconnected. Remaining:', sseClients.size);
   });
 
   req.on('error', (error) => {
-    console.error(`SSE connection error for session ${sessionId}:`, error.message);
-    session.sseClients.delete(res);
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+    console.error('SSE connection error:', error.message);
   });
 });
 
 // Handle MCP JSON-RPC messages via POST
 app.post('/mcp/v1/sse', async (req, res) => {
+  const startTime = Date.now();
+  
   try {
-    console.log('Received MCP message:', req.body);
+    console.log('MCP message received:', req.body.method, 'id:', req.body.id);
     
     const { jsonrpc, id, method, params } = req.body;
     
@@ -444,63 +362,43 @@ app.post('/mcp/v1/sse', async (req, res) => {
       });
     }
 
-    // Get session
-    const sessionId = req.headers['mcp-session-id'] || 'default';
-    let session = sessions.get(sessionId);
-    
-    if (!session) {
-      session = new MCPSession(sessionId);
-      sessions.set(sessionId, session);
-      
-      // Wait for initialization
-      await new Promise((resolve, reject) => {
-        const checkInit = () => {
-          if (session.initialized) {
-            resolve();
-          } else if (session.process?.killed) {
-            reject(new Error('MCP process died'));
-          } else {
-            setTimeout(checkInit, 100);
-          }
-        };
-        checkInit();
-        
-        // Timeout after 5 seconds
-        setTimeout(() => reject(new Error('Initialization timeout')), 5000);
-      });
-    }
-
     let result;
 
-    // Handle different methods
+    // Handle methods with immediate responses
     switch (method) {
       case 'ping':
-        result = await session.ping();
+        result = await globalMCPSession.ping();
+        console.log(`Ping responded in ${Date.now() - startTime}ms`);
         break;
       
       case 'tools/list':
-        result = await session.listTools();
+        result = await globalMCPSession.listTools();
+        console.log(`Tools list responded in ${Date.now() - startTime}ms with ${result.tools.length} tools`);
         break;
         
       case 'tools/call':
-        result = await session.callTool(params.name, params.arguments || params.input || {});
+        if (!isGlobalSessionReady) {
+          throw new Error('MCP session not ready');
+        }
+        result = await globalMCPSession.callTool(params.name, params.arguments || params.input || {});
+        console.log(`Tool call ${params.name} responded in ${Date.now() - startTime}ms`);
         break;
         
       default:
-        // Forward other methods to the MCP server
-        result = await session.sendMCPMessage(method, params);
-        break;
+        throw new Error(`Unsupported method: ${method}`);
     }
 
-    // Send JSON-RPC response
-    res.json({
+    // Send successful JSON-RPC response
+    const response = {
       jsonrpc: "2.0",
       id,
       result
-    });
+    };
+    
+    res.json(response);
 
   } catch (error) {
-    console.error('Error handling MCP message:', error);
+    console.error(`Error handling ${req.body.method}:`, error.message);
     
     const errorResponse = {
       jsonrpc: "2.0",
@@ -515,20 +413,14 @@ app.post('/mcp/v1/sse', async (req, res) => {
   }
 });
 
-// Memory operations endpoints
+// Legacy REST endpoints for backward compatibility
 app.post('/mcp/v1/memory', async (req, res) => {
   try {
-    const sessionId = req.headers['mcp-session-id'] || 'default';
-    let session = sessions.get(sessionId);
-    
-    if (!session) {
-      session = new MCPSession(sessionId);
-      sessions.set(sessionId, session);
-      // Wait for initialization
-      await new Promise(resolve => setTimeout(resolve, 2000));
+    if (!isGlobalSessionReady) {
+      throw new Error('MCP session not ready');
     }
-
-    const result = await session.callTool('memory.create', req.body);
+    
+    const result = await globalMCPSession.callTool('memory.create', req.body);
     
     res.json({
       status: 'success',
@@ -545,16 +437,10 @@ app.post('/mcp/v1/memory', async (req, res) => {
 
 app.get('/mcp/v1/memory/search', async (req, res) => {
   try {
-    const sessionId = req.headers['mcp-session-id'] || 'default';
-    let session = sessions.get(sessionId);
-    
-    if (!session) {
-      session = new MCPSession(sessionId);
-      sessions.set(sessionId, session);
-      // Wait for initialization
-      await new Promise(resolve => setTimeout(resolve, 2000));
+    if (!isGlobalSessionReady) {
+      throw new Error('MCP session not ready');
     }
-
+    
     const { query, type, tags, limit } = req.query;
     const searchArgs = { query };
     
@@ -562,7 +448,7 @@ app.get('/mcp/v1/memory/search', async (req, res) => {
     if (tags) searchArgs.tags = tags.split(',');
     if (limit) searchArgs.limit = parseInt(limit);
 
-    const result = await session.callTool('memory.search', searchArgs);
+    const result = await globalMCPSession.callTool('memory.search', searchArgs);
     
     res.json({
       status: 'success',
@@ -579,23 +465,17 @@ app.get('/mcp/v1/memory/search', async (req, res) => {
 
 app.get('/mcp/v1/memory', async (req, res) => {
   try {
-    const sessionId = req.headers['mcp-session-id'] || 'default';
-    let session = sessions.get(sessionId);
-    
-    if (!session) {
-      session = new MCPSession(sessionId);
-      sessions.set(sessionId, session);
-      // Wait for initialization
-      await new Promise(resolve => setTimeout(resolve, 2000));
+    if (!isGlobalSessionReady) {
+      throw new Error('MCP session not ready');
     }
-
+    
     const { type, tags } = req.query;
     const listArgs = {};
     
     if (type) listArgs.type = type;
     if (tags) listArgs.tags = tags.split(',');
 
-    const result = await session.callTool('memory.list', listArgs);
+    const result = await globalMCPSession.callTool('memory.list', listArgs);
     
     res.json({
       status: 'success',
@@ -613,17 +493,7 @@ app.get('/mcp/v1/memory', async (req, res) => {
 // Tools endpoint
 app.get('/mcp/v1/tools', async (req, res) => {
   try {
-    const sessionId = req.headers['mcp-session-id'] || 'default';
-    let session = sessions.get(sessionId);
-    
-    if (!session) {
-      session = new MCPSession(sessionId);
-      sessions.set(sessionId, session);
-      // Wait for initialization
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-
-    const result = await session.listTools();
+    const result = await globalMCPSession.listTools();
     
     res.json({
       status: 'success',
@@ -638,44 +508,15 @@ app.get('/mcp/v1/tools', async (req, res) => {
   }
 });
 
-// Generic tool call endpoint
-app.post('/mcp/v1/tools/:toolName', async (req, res) => {
-  try {
-    const { toolName } = req.params;
-    const sessionId = req.headers['mcp-session-id'] || 'default';
-    let session = sessions.get(sessionId);
-    
-    if (!session) {
-      session = new MCPSession(sessionId);
-      sessions.set(sessionId, session);
-      // Wait for initialization
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-
-    const result = await session.callTool(toolName, req.body);
-    
-    res.json({
-      status: 'success',
-      data: result
-    });
-  } catch (error) {
-    console.error(`Error calling tool ${req.params.toolName}:`, error);
-    res.status(500).json({
-      status: 'error',
-      error: error.message
-    });
-  }
-});
-
-// Cleanup sessions periodically
+// Keep global session alive
 setInterval(() => {
-  for (const [sessionId, session] of sessions.entries()) {
-    if (session.sseClients.size === 0 && !session.process?.killed) {
-      console.log(`Cleaning up inactive session: ${sessionId}`);
-      session.cleanup();
-    }
+  if (globalMCPSession && isGlobalSessionReady) {
+    // Send a ping to keep the session active
+    globalMCPSession.ping().catch(() => {
+      console.log('Session ping failed, may need restart');
+    });
   }
-}, 60000); // Check every minute
+}, 60000);
 
 // Start the HTTP server
 app.listen(PORT, '0.0.0.0', () => {
@@ -688,9 +529,8 @@ app.listen(PORT, '0.0.0.0', () => {
 process.on('SIGTERM', () => {
   console.log('Received SIGTERM, shutting down gracefully...');
   
-  // Cleanup all sessions
-  for (const session of sessions.values()) {
-    session.cleanup();
+  if (globalMCPSession) {
+    globalMCPSession.cleanup();
   }
   
   process.exit(0);
@@ -699,9 +539,8 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
   console.log('Received SIGINT, shutting down gracefully...');
   
-  // Cleanup all sessions
-  for (const session of sessions.values()) {
-    session.cleanup();
+  if (globalMCPSession) {
+    globalMCPSession.cleanup();
   }
   
   process.exit(0);
